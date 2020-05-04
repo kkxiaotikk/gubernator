@@ -44,6 +44,7 @@ type ServerConfig struct {
 	HTTPListenAddress    string
 	EtcdKeyPrefix        string
 	CacheSize            int
+	DataCenter           string
 
 	// Etcd configuration used to find peers
 	EtcdConf etcd.Config
@@ -53,6 +54,9 @@ type ServerConfig struct {
 
 	// K8s configuration used to find peers inside a K8s cluster
 	K8PoolConf gubernator.K8sPoolConfig
+
+	// Memberlist configuration used to find peers
+	MemberlistPoolConfig gubernator.MemberlistPoolConfig
 }
 
 func confFromEnv() (ServerConfig, error) {
@@ -90,6 +94,7 @@ func confFromEnv() (ServerConfig, error) {
 	setter.SetDefault(&conf.GRPCListenAddress, os.Getenv("GUBER_GRPC_ADDRESS"), "0.0.0.0:81")
 	setter.SetDefault(&conf.HTTPListenAddress, os.Getenv("GUBER_HTTP_ADDRESS"), "0.0.0.0:80")
 	setter.SetDefault(&conf.CacheSize, getEnvInteger("GUBER_CACHE_SIZE"), 50000)
+	setter.SetDefault(&conf.DataCenter, os.Getenv("GUBER_DATA_CENTER"), "")
 
 	// Behaviors
 	setter.SetDefault(&conf.Behaviors.BatchTimeout, getEnvDuration("GUBER_BATCH_TIMEOUT"))
@@ -100,6 +105,10 @@ func confFromEnv() (ServerConfig, error) {
 	setter.SetDefault(&conf.Behaviors.GlobalBatchLimit, getEnvInteger("GUBER_GLOBAL_BATCH_LIMIT"))
 	setter.SetDefault(&conf.Behaviors.GlobalSyncWait, getEnvDuration("GUBER_GLOBAL_SYNC_WAIT"))
 
+	setter.SetDefault(&conf.Behaviors.MultiRegionTimeout, getEnvDuration("GUBER_MULTI_REGION_TIMEOUT"))
+	setter.SetDefault(&conf.Behaviors.MultiRegionBatchLimit, getEnvInteger("GUBER_MULTI_REGION_BATCH_LIMIT"))
+	setter.SetDefault(&conf.Behaviors.MultiRegionSyncWait, getEnvDuration("GUBER_MULTI_REGION_SYNC_WAIT"))
+
 	// ETCD Config
 	setter.SetDefault(&conf.EtcdAdvertiseAddress, os.Getenv("GUBER_ETCD_ADVERTISE_ADDRESS"), "127.0.0.1:81")
 	setter.SetDefault(&conf.EtcdKeyPrefix, os.Getenv("GUBER_ETCD_KEY_PREFIX"), "/gubernator-peers")
@@ -107,6 +116,11 @@ func confFromEnv() (ServerConfig, error) {
 	setter.SetDefault(&conf.EtcdConf.DialTimeout, getEnvDuration("GUBER_ETCD_DIAL_TIMEOUT"), time.Second*5)
 	setter.SetDefault(&conf.EtcdConf.Username, os.Getenv("GUBER_ETCD_USER"))
 	setter.SetDefault(&conf.EtcdConf.Password, os.Getenv("GUBER_ETCD_PASSWORD"))
+
+	// Memberlist Config
+	setter.SetDefault(&conf.MemberlistPoolConfig.AdvertiseAddress, os.Getenv("GUBER_MEMBERLIST_ADVERTISE_ADDRESS"), "")
+	setter.SetDefault(&conf.MemberlistPoolConfig.AdvertisePort, os.Getenv("GUBER_MEMBERLIST_ADVERTISE_PORT"), 7946)
+	setter.SetDefault(&conf.MemberlistPoolConfig.KnownNodes, getEnvSlice("GUBER_MEMBERLIST_KNOWN_NODES"), "")
 
 	// Kubernetes Config
 	setter.SetDefault(&conf.K8PoolConf.Namespace, os.Getenv("GUBER_K8S_NAMESPACE"), "default")
