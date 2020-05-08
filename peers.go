@@ -75,6 +75,14 @@ func NewPeerClient(conf BehaviorConfig, host string) (*PeerClient, error) {
 	return c, nil
 }
 
+// PeerInfo returns PeerInfo struct that describes this PeerClient
+func (c *PeerClient) PeerInfo() PeerInfo {
+	return PeerInfo{
+		Address: c.host,
+		IsOwner: c.isOwner,
+	}
+}
+
 // GetPeerRateLimit forwards a rate limit request to a peer. If the rate limit has `behavior == BATCHING` configured
 // this method will attempt to batch the rate limits
 func (c *PeerClient) GetPeerRateLimit(ctx context.Context, r *RateLimitReq) (*RateLimitResp, error) {

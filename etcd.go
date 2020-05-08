@@ -28,8 +28,9 @@ import (
 )
 
 type PeerInfo struct {
-	Address string
-	IsOwner bool
+	HTTPAddress string
+	Address     string
+	IsOwner     bool
 }
 
 type UpdateFunc func([]PeerInfo)

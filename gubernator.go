@@ -46,6 +46,8 @@ type Instance struct {
 	isClosed  bool
 }
 
+// TODO(thrawn01): Rename this NewV1Server() in the next version to differentiate
+//   from `NewDaemon` and compliment NewV1Client()
 func New(conf Config) (*Instance, error) {
 	if conf.GRPCServer == nil {
 		return nil, errors.New("GRPCServer instance is required")

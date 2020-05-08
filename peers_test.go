@@ -41,7 +41,7 @@ func TestPeerClientShutdown(t *testing.T) {
 
 		t.Run(c.Name, func(t *testing.T) {
 
-			client, err := gubernator.NewPeerClient(config, cluster.GetPeer())
+			client, err := gubernator.NewPeerClient(config, cluster.GetRandomPeer().GRPCAddress)
 			assert.NoError(t, err)
 
 			wg := sync.WaitGroup{}

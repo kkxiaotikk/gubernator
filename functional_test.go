@@ -19,6 +19,7 @@ package gubernator_test
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"testing"
 	"time"
@@ -31,15 +32,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Setup and shutdown the mailgun mock server for the entire test suite
+// Setup and shutdown the a cluster of servers for the entire test suite
 func TestMain(m *testing.M) {
-	if err := cluster.StartWith([]string{
-		"127.0.0.1:9990",
-		"127.0.0.1:9991",
-		"127.0.0.1:9992",
-		"127.0.0.1:9993",
-		"127.0.0.1:9994",
-		"127.0.0.1:9995",
+	if err := cluster.StartWith([]cluster.Address{
+		{GRPCAddress: "127.0.0.1:9990"},
+		{GRPCAddress: "127.0.0.1:9991"},
+		{GRPCAddress: "127.0.0.1:9992"},
+		{GRPCAddress: "127.0.0.1:9993"},
+		{GRPCAddress: "127.0.0.1:9994"},
+		{GRPCAddress: "127.0.0.1:9995"},
 	}); err != nil {
 		fmt.Println(err)
 		os.Exit(1)
@@ -49,7 +50,7 @@ func TestMain(m *testing.M) {
 }
 
 func TestOverTheLimit(t *testing.T) {
-	client, errs := guber.DialV1Server(cluster.GetPeer())
+	client, errs := guber.DialV1Server(cluster.GetRandomPeer().GRPCAddress)
 	require.Nil(t, errs)
 
 	tests := []struct {
@@ -95,7 +96,7 @@ func TestOverTheLimit(t *testing.T) {
 }
 
 func TestTokenBucket(t *testing.T) {
-	client, errs := guber.DialV1Server(cluster.GetPeer())
+	client, errs := guber.DialV1Server(cluster.GetRandomPeer().GRPCAddress)
 	require.Nil(t, errs)
 
 	tests := []struct {
@@ -146,7 +147,7 @@ func TestTokenBucket(t *testing.T) {
 }
 
 func TestLeakyBucket(t *testing.T) {
-	client, errs := guber.DialV1Server(cluster.GetPeer())
+	client, errs := guber.DialV1Server(cluster.GetRandomPeer().GRPCAddress)
 	require.Nil(t, errs)
 
 	tests := []struct {
@@ -207,7 +208,7 @@ func TestLeakyBucket(t *testing.T) {
 }
 
 func TestMissingFields(t *testing.T) {
-	client, errs := guber.DialV1Server(cluster.GetPeer())
+	client, errs := guber.DialV1Server(cluster.GetRandomPeer().GRPCAddress)
 	require.Nil(t, errs)
 
 	tests := []struct {
@@ -270,7 +271,7 @@ func TestMissingFields(t *testing.T) {
 }
 
 func TestGlobalRateLimits(t *testing.T) {
-	peer := cluster.PeerAt(0)
+	peer := cluster.PeerAt(0).GRPCAddress
 	client, errs := guber.DialV1Server(peer)
 	require.Nil(t, errs)
 
@@ -314,9 +315,9 @@ func TestGlobalRateLimits(t *testing.T) {
 	sendHit(guber.Status_UNDER_LIMIT, 3, 3)
 
 	// Inspect our metrics, ensure they collected the counts we expected during this test
-	instance := cluster.InstanceAt(0)
+	d := cluster.DaemonAt(0)
 	metricCh := make(chan prometheus.Metric, 5)
-	instance.Guber.Collect(metricCh)
+	d.V1Server.Collect(metricCh)
 
 	buf := dto.Metric{}
 	m := <-metricCh // Async metric
@@ -324,9 +325,9 @@ func TestGlobalRateLimits(t *testing.T) {
 	assert.Equal(t, uint64(1), *buf.Histogram.SampleCount)
 
 	// Instance 3 should be the owner of our global rate limit
-	instance = cluster.InstanceAt(3)
+	d = cluster.DaemonAt(3)
 	metricCh = make(chan prometheus.Metric, 5)
-	instance.Guber.Collect(metricCh)
+	d.V1Server.Collect(metricCh)
 
 	m = <-metricCh // Async metric
 	m = <-metricCh // Broadcast metric
@@ -335,7 +336,7 @@ func TestGlobalRateLimits(t *testing.T) {
 }
 
 func TestChangeLimit(t *testing.T) {
-	client, errs := guber.DialV1Server(cluster.GetPeer())
+	client, errs := guber.DialV1Server(cluster.GetRandomPeer().GRPCAddress)
 	require.Nil(t, errs)
 
 	tests := []struct {
@@ -423,7 +424,7 @@ func TestChangeLimit(t *testing.T) {
 }
 
 func TestResetRemaining(t *testing.T) {
-	client, errs := guber.DialV1Server(cluster.GetPeer())
+	client, errs := guber.DialV1Server(cluster.GetRandomPeer().GRPCAddress)
 	require.Nil(t, errs)
 
 	tests := []struct {
@@ -492,6 +493,17 @@ func TestResetRemaining(t *testing.T) {
 			assert.Equal(t, tt.Limit, rl.Limit)
 		})
 	}
+}
+
+func TestGRPCGateway(t *testing.T) {
+	resp, errs := http.DefaultClient.Get("http://" + cluster.GetRandomPeer().HTTPAddress + "/v1/HealthCheck")
+	require.Nil(t, errs)
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	// TODO: Test /cmd/gubernator
+	// TODO: Fix GRPC Gateway
+	// TODO: Update docker image
+	// TODO: Update docker-compose
 }
 
 // TODO: Add a test for sending no rate limits RateLimitReqList.RateLimits = nil

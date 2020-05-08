@@ -18,109 +18,46 @@ package main
 
 import (
 	"context"
-	"net"
-	"net/http"
+	"crypto/tls"
+	"crypto/x509"
+	"flag"
+	"fmt"
+	"io/ioutil"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
+	"time"
 
-	"github.com/grpc-ecosystem/grpc-gateway/runtime"
+	etcd "github.com/coreos/etcd/clientv3"
+	"github.com/davecgh/go-spew/spew"
 	"github.com/mailgun/gubernator"
-	"github.com/mailgun/holster/v3/etcdutil"
-	"github.com/mailgun/holster/v3/syncutil"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/mailgun/holster/v3/setter"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	"google.golang.org/grpc"
+	"k8s.io/klog"
 )
 
 var log = logrus.WithField("category", "server")
 var Version = "dev-build"
 
 func main() {
-	var wg syncutil.WaitGroup
-	var conf ServerConfig
-	var err error
+	var configFile string
+
+	flags := flag.NewFlagSet("gubernator", flag.ContinueOnError)
+	flags.StringVar(&configFile, "config", "", "yaml config file")
+	flags.BoolVar(&gubernator.DebugEnabled, "debug", false, "enable debug")
+	checkErr(flags.Parse(os.Args[1:]), "while parsing flags")
 
 	// Read our config from the environment or optional environment config file
-	conf, err = confFromEnv()
+	conf, err := confFromFile(configFile)
 	checkErr(err, "while getting config")
 
-	// The LRU cache we store rate limits in
-	cache := gubernator.NewLRUCache(conf.CacheSize)
-
-	// cache also implements prometheus.Collector interface
-	prometheus.MustRegister(cache)
-
-	// Handler to collect duration and API access metrics for GRPC
-	statsHandler := gubernator.NewGRPCStatsHandler()
-
-	// New GRPC server
-	grpcSrv := grpc.NewServer(
-		grpc.StatsHandler(statsHandler),
-		grpc.MaxRecvMsgSize(1024*1024))
-
-	// Registers a new gubernator instance with the GRPC server
-	guber, err := gubernator.New(gubernator.Config{
-		GRPCServer: grpcSrv,
-		Cache:      cache,
-	})
-	checkErr(err, "while creating new gubernator instance")
-
-	// guber instance also implements prometheus.Collector interface
-	prometheus.MustRegister(guber)
-
-	// Start serving GRPC Requests
-	wg.Go(func() {
-		listener, err := net.Listen("tcp", conf.GRPCListenAddress)
-		checkErr(err, "while starting GRPC listener")
-
-		log.Infof("Gubernator Listening on %s ...", conf.GRPCListenAddress)
-		checkErr(grpcSrv.Serve(listener), "while starting GRPC server")
-	})
-
-	var pool gubernator.PoolInterface
-
-	if conf.K8PoolConf.Enabled {
-		// Source our list of peers from kubernetes endpoint API
-		conf.K8PoolConf.OnUpdate = guber.SetPeers
-		pool, err = gubernator.NewK8sPool(conf.K8PoolConf)
-		checkErr(err, "while querying kubernetes API")
-	} else {
-		// Register ourselves with other peers via ETCD
-		etcdClient, err := etcdutil.NewClient(&conf.EtcdConf)
-		checkErr(err, "while connecting to etcd")
-
-		pool, err = gubernator.NewEtcdPool(gubernator.EtcdPoolConfig{
-			AdvertiseAddress: conf.EtcdAdvertiseAddress,
-			OnUpdate:         guber.SetPeers,
-			Client:           etcdClient,
-			BaseKey:          conf.EtcdKeyPrefix,
-		})
-		checkErr(err, "while registering with ETCD pool")
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Setup an JSON Gateway API for our GRPC methods
-	gateway := runtime.NewServeMux()
-	err = gubernator.RegisterV1HandlerFromEndpoint(ctx, gateway,
-		conf.EtcdAdvertiseAddress, []grpc.DialOption{grpc.WithInsecure()})
-	checkErr(err, "while registering GRPC gateway handler")
-
-	// Serve the JSON Gateway and metrics handlers via standard HTTP/1
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.Handler())
-	mux.Handle("/", gateway)
-	httpSrv := &http.Server{Addr: conf.GRPCListenAddress, Handler: mux}
-
-	wg.Go(func() {
-		listener, err := net.Listen("tcp", conf.HTTPListenAddress)
-		checkErr(err, "while starting HTTP listener")
-
-		log.Infof("HTTP Gateway Listening on %s ...", conf.HTTPListenAddress)
-		checkErr(httpSrv.Serve(listener), "while starting HTTP server")
-	})
+	// Start the server
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+	srv, err := gubernator.NewDaemon(ctx, conf)
+	checkErr(err, "while starting server")
+	cancel()
 
 	// Wait here for signals to clean up our mess
 	c := make(chan os.Signal, 1)
@@ -128,14 +65,212 @@ func main() {
 	for sig := range c {
 		if sig == os.Interrupt {
 			log.Info("caught interrupt; user requested premature exit")
-			pool.Close()
-			httpSrv.Shutdown(ctx)
-			grpcSrv.GracefulStop()
-			wg.Stop()
-			statsHandler.Close()
+			srv.Close()
 			os.Exit(0)
 		}
 	}
+}
+
+func confFromFile(configFile string) (gubernator.DaemonConfig, error) {
+	var conf gubernator.DaemonConfig
+
+	// in order to prevent logging to /tmp by k8s.io/client-go
+	// and other kubernetes related dependencies which are using
+	// klog (https://github.com/kubernetes/klog), we need to
+	// initialize klog in the way it prints to stderr only.
+	klog.InitFlags(nil)
+	flag.Set("logtostderr", "true")
+
+	if gubernator.DebugEnabled || os.Getenv("GUBER_DEBUG") != "" {
+		logrus.SetLevel(logrus.DebugLevel)
+		logrus.Debug("Debug enabled")
+		gubernator.DebugEnabled = true
+	}
+
+	if configFile != "" {
+		log.Infof("Loading env config: %s", configFile)
+		if err := fromEnvFile(configFile); err != nil {
+			return conf, err
+		}
+	}
+
+	// Main config
+	setter.SetDefault(&conf.GRPCListenAddress, os.Getenv("GUBER_GRPC_ADDRESS"), "0.0.0.0:81")
+	setter.SetDefault(&conf.HTTPListenAddress, os.Getenv("GUBER_HTTP_ADDRESS"), "0.0.0.0:80")
+	setter.SetDefault(&conf.CacheSize, getEnvInteger("GUBER_CACHE_SIZE"), 50000)
+
+	// Behaviors
+	setter.SetDefault(&conf.Behaviors.BatchTimeout, getEnvDuration("GUBER_BATCH_TIMEOUT"))
+	setter.SetDefault(&conf.Behaviors.BatchLimit, getEnvInteger("GUBER_BATCH_LIMIT"))
+	setter.SetDefault(&conf.Behaviors.BatchWait, getEnvDuration("GUBER_BATCH_WAIT"))
+
+	setter.SetDefault(&conf.Behaviors.GlobalTimeout, getEnvDuration("GUBER_GLOBAL_TIMEOUT"))
+	setter.SetDefault(&conf.Behaviors.GlobalBatchLimit, getEnvInteger("GUBER_GLOBAL_BATCH_LIMIT"))
+	setter.SetDefault(&conf.Behaviors.GlobalSyncWait, getEnvDuration("GUBER_GLOBAL_SYNC_WAIT"))
+
+	// ETCD Config
+	setter.SetDefault(&conf.EtcdAdvertiseAddress, os.Getenv("GUBER_ETCD_ADVERTISE_ADDRESS"), "127.0.0.1:81")
+	setter.SetDefault(&conf.EtcdKeyPrefix, os.Getenv("GUBER_ETCD_KEY_PREFIX"), "/gubernator-peers")
+	setter.SetDefault(&conf.EtcdConf.Endpoints, getEnvSlice("GUBER_ETCD_ENDPOINTS"), []string{"localhost:2379"})
+	setter.SetDefault(&conf.EtcdConf.DialTimeout, getEnvDuration("GUBER_ETCD_DIAL_TIMEOUT"), time.Second*5)
+	setter.SetDefault(&conf.EtcdConf.Username, os.Getenv("GUBER_ETCD_USER"))
+	setter.SetDefault(&conf.EtcdConf.Password, os.Getenv("GUBER_ETCD_PASSWORD"))
+
+	// Kubernetes Config
+	setter.SetDefault(&conf.K8PoolConf.Namespace, os.Getenv("GUBER_K8S_NAMESPACE"), "default")
+	conf.K8PoolConf.PodIP = os.Getenv("GUBER_K8S_POD_IP")
+	conf.K8PoolConf.PodPort = os.Getenv("GUBER_K8S_POD_PORT")
+	conf.K8PoolConf.Selector = os.Getenv("GUBER_K8S_ENDPOINTS_SELECTOR")
+
+	if anyHasPrefix("GUBER_K8S_", os.Environ()) {
+		logrus.Debug("K8s peer pool config found")
+		conf.K8PoolConf.Enabled = true
+		if conf.K8PoolConf.Selector == "" {
+			return conf, errors.New("when using k8s for peer discovery, you MUST provide a " +
+				"`GUBER_K8S_ENDPOINTS_SELECTOR` to select the gubernator peers from the endpoints listing")
+		}
+	}
+
+	if anyHasPrefix("GUBER_ETCD_", os.Environ()) {
+		logrus.Debug("ETCD peer pool config found")
+		if conf.K8PoolConf.Enabled {
+			return conf, errors.New("refusing to register gubernator peers with both etcd and k8s;" +
+				" remove either `GUBER_ETCD_*` or `GUBER_K8S_*` variables from the environment")
+		}
+	}
+
+	// If env contains any TLS configuration
+	if anyHasPrefix("GUBER_ETCD_TLS_", os.Environ()) {
+		if err := setupTLS(&conf.EtcdConf); err != nil {
+			return conf, err
+		}
+	}
+
+	if gubernator.DebugEnabled {
+		spew.Dump(conf)
+	}
+
+	return conf, nil
+}
+
+func setupTLS(conf *etcd.Config) error {
+	var tlsCertFile, tlsKeyFile, tlsCAFile string
+
+	// set `GUBER_ETCD_TLS_ENABLE` and this line will
+	// create a TLS config with no config.
+	setter.SetDefault(&conf.TLS, &tls.Config{})
+
+	setter.SetDefault(&tlsCertFile, os.Getenv("GUBER_ETCD_TLS_CERT"))
+	setter.SetDefault(&tlsKeyFile, os.Getenv("GUBER_ETCD_TLS_KEY"))
+	setter.SetDefault(&tlsCAFile, os.Getenv("GUBER_ETCD_TLS_CA"))
+
+	// If the CA file was provided
+	if tlsCAFile != "" {
+		setter.SetDefault(&conf.TLS, &tls.Config{})
+
+		var certPool *x509.CertPool = nil
+		if pemBytes, err := ioutil.ReadFile(tlsCAFile); err == nil {
+			certPool = x509.NewCertPool()
+			certPool.AppendCertsFromPEM(pemBytes)
+		} else {
+			return errors.Wrapf(err, "while loading cert CA file '%s'", tlsCAFile)
+		}
+		setter.SetDefault(&conf.TLS.RootCAs, certPool)
+		conf.TLS.InsecureSkipVerify = false
+	}
+
+	// If the cert and key files are provided attempt to load them
+	if tlsCertFile != "" && tlsKeyFile != "" {
+		tlsCert, err := tls.LoadX509KeyPair(tlsCertFile, tlsKeyFile)
+		if err != nil {
+			return errors.Wrapf(err, "while loading cert '%s' and key file '%s'",
+				tlsCertFile, tlsKeyFile)
+		}
+		setter.SetDefault(&conf.TLS.Certificates, []tls.Certificate{tlsCert})
+	}
+
+	// If no other TLS config is provided this will force connecting with TLS,
+	// without cert verification
+	if os.Getenv("GUBER_ETCD_TLS_SKIP_VERIFY") != "" {
+		setter.SetDefault(&conf.TLS, &tls.Config{})
+		conf.TLS.InsecureSkipVerify = true
+	}
+	return nil
+}
+
+func anyHasPrefix(prefix string, items []string) bool {
+	for _, i := range items {
+		if strings.HasPrefix(i, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func getEnvInteger(name string) int {
+	v := os.Getenv(name)
+	if v == "" {
+		return 0
+	}
+	i, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		log.WithError(err).Errorf("while parsing '%s' as an integer", name)
+		return 0
+	}
+	return int(i)
+}
+
+func getEnvDuration(name string) time.Duration {
+	v := os.Getenv(name)
+	if v == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		log.WithError(err).Errorf("while parsing '%s' as a duration", name)
+		return 0
+	}
+	return d
+}
+
+func getEnvSlice(name string) []string {
+	v := os.Getenv(name)
+	if v == "" {
+		return nil
+	}
+	return strings.Split(v, ",")
+}
+
+// Take values from a file in the format `GUBER_CONF_ITEM=my-value` and put them into the environment
+// lines that begin with `#` are ignored
+func fromEnvFile(configFile string) error {
+	fd, err := os.Open(configFile)
+	if err != nil {
+		return fmt.Errorf("while opening config file: %s", err)
+	}
+
+	contents, err := ioutil.ReadAll(fd)
+	if err != nil {
+		return fmt.Errorf("while reading config file '%s': %s", configFile, err)
+	}
+	for i, line := range strings.Split(string(contents), "\n") {
+		// Skip comments, empty lines or lines with tabs
+		if strings.HasPrefix(line, "#") || strings.HasPrefix(line, " ") ||
+			strings.HasPrefix(line, "\t") || len(line) == 0 {
+			continue
+		}
+
+		logrus.Debugf("config: [%d] '%s'", i, line)
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			return errors.Errorf("malformed key=value on line '%d'", i)
+		}
+
+		if err := os.Setenv(parts[0], parts[1]); err != nil {
+			return errors.Wrapf(err, "while settings environ for '%s=%s'", parts[0], parts[1])
+		}
+	}
+	return nil
 }
 
 func checkErr(err error, msg string) {
