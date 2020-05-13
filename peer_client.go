@@ -152,8 +152,6 @@ func (c *PeerClient) GetPeerRateLimits(ctx context.Context, r *GetPeerRateLimits
 	c.wg.Add(1)
 	defer c.wg.Done()
 
-	c.mutex.RUnlock()
-
 	resp, err := c.client.GetPeerRateLimits(ctx, r)
 	if err != nil {
 		c.setLastError(err, time.Now(), c.info.Address)
@@ -177,8 +175,6 @@ func (c *PeerClient) UpdatePeerGlobals(ctx context.Context, r *UpdatePeerGlobals
 	// See NOTE above about RLock and wg.Add(1)
 	c.wg.Add(1)
 	defer c.wg.Done()
-
-	c.mutex.RUnlock()
 
 	return c.client.UpdatePeerGlobals(ctx, r)
 }
@@ -213,9 +209,6 @@ func (c *PeerClient) getPeerRateLimitsBatch(ctx context.Context, r *RateLimitReq
 	// See NOTE above about RLock and wg.Add(1)
 	c.wg.Add(1)
 	defer c.wg.Done()
-
-	// Unlock to prevent the chan from being closed
-	c.mutex.RUnlock()
 
 	// Wait for a response or context cancel
 	select {
